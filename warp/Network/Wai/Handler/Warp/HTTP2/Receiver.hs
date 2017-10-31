@@ -6,15 +6,13 @@
 
 module Network.Wai.Handler.Warp.HTTP2.Receiver (frameReceiver) where
 
-#if __GLASGOW_HASKELL__ < 709
-import Control.Applicative
-#endif
 import Control.Concurrent
 import Control.Concurrent.STM
 import qualified Control.Exception as E
 import Control.Monad (when, unless, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.IORef
 import Network.HPACK
 import Network.HPACK.Token
 import Network.HTTP2
@@ -23,7 +21,6 @@ import Network.Wai.Handler.Warp.HTTP2.EncodeFrame
 import Network.Wai.Handler.Warp.HTTP2.HPACK
 import Network.Wai.Handler.Warp.HTTP2.Request
 import Network.Wai.Handler.Warp.HTTP2.Types
-import Network.Wai.Handler.Warp.IORef
 import Network.Wai.Handler.Warp.ReadInt
 import Network.Wai.Handler.Warp.Types
 
@@ -232,9 +229,12 @@ control FrameGoAway _ _ Context{controlQ} = do
 
 control FrameWindowUpdate header bs Context{connectionWindow} = do
     WindowUpdateFrame n <- guardIt $ decodeWindowUpdateFrame header bs
-    !w <- (n +) <$> atomically (readTVar connectionWindow)
+    !w <- atomically $ do
+      w0 <- readTVar connectionWindow
+      let !w1 = w0 + n
+      writeTVar connectionWindow w1
+      return w1
     when (isWindowOverflow w) $ E.throwIO $ ConnectionError FlowControlError "control window should be less than 2^31"
-    atomically $ writeTVar connectionWindow w
     return True
 
 control _ _ _ _ =
@@ -336,10 +336,13 @@ stream FrameContinuation FrameHeader{flags} frag ctx (Open (Continued rfrags siz
 
 stream FrameWindowUpdate header@FrameHeader{streamId} bs _ s Stream{streamWindow} = do
     WindowUpdateFrame n <- guardIt $ decodeWindowUpdateFrame header bs
-    !w <- (n +) <$> atomically (readTVar streamWindow)
+    !w <- atomically $ do
+      w0 <- readTVar streamWindow
+      let !w1 = w0 + n
+      writeTVar streamWindow w1
+      return w1
     when (isWindowOverflow w) $
         E.throwIO $ StreamError FlowControlError streamId
-    atomically $ writeTVar streamWindow w
     return s
 
 stream FrameRSTStream header bs ctx _ strm = do

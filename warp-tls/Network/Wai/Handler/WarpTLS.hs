@@ -4,7 +4,6 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE PatternGuards #-}
-{-# LANGUAGE CPP #-}
 
 -- | HTTP over TLS support for Warp via the TLS package.
 --
@@ -31,6 +30,7 @@ module Network.Wai.Handler.WarpTLS (
     , tlsWantClientCert
     , tlsServerHooks
     , tlsServerDHEParams
+    , tlsSessionManagerConfig
     , onInsecure
     , OnInsecure (..)
     -- * Runner
@@ -42,13 +42,10 @@ module Network.Wai.Handler.WarpTLS (
     , DH.generateParams
     ) where
 
-#if __GLASGOW_HASKELL__ < 709
-import Control.Applicative ((<$>))
-#endif
 import Control.Applicative ((<|>))
-import Control.Exception (Exception, throwIO, bracket, finally, handle, fromException, try, IOException, onException, SomeException(..))
+import Control.Exception (Exception, throwIO, bracket, finally, handle, fromException, try, IOException, onException, SomeException(..), handleJust)
 import qualified Control.Exception as E
-import Control.Monad (void)
+import Control.Monad (void, guard)
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Lazy as L
 import Data.Default.Class (def)
@@ -60,6 +57,7 @@ import Network.Socket.ByteString (sendAll)
 import qualified Network.TLS as TLS
 import qualified Crypto.PubKey.DH as DH
 import qualified Network.TLS.Extra as TLSExtra
+import qualified Network.TLS.SessionManager as SM
 import Network.Wai (Application)
 import Network.Wai.Handler.Warp
 import Network.Wai.Handler.Warp.Internal
@@ -102,7 +100,7 @@ data TLSSettings = TLSSettings {
     -- ^ The TLS ciphers this server accepts.
     --
     -- >>> tlsCiphers defaultTlsSettings
-    -- [ECDHE-RSA-AES128GCM-SHA256,DHE-RSA-AES128GCM-SHA256,DHE-RSA-AES256-SHA256,DHE-RSA-AES128-SHA256,DHE-RSA-AES256-SHA1,DHE-RSA-AES128-SHA1,DHE-DSA-AES128-SHA1,DHE-DSA-AES256-SHA1,RSA-aes128-sha1,RSA-aes256-sha1]
+    -- [ECDHE-ECDSA-AES256GCM-SHA384,ECDHE-ECDSA-AES128GCM-SHA256,ECDHE-RSA-AES256GCM-SHA384,ECDHE-RSA-AES128GCM-SHA256,DHE-RSA-AES256GCM-SHA384,DHE-RSA-AES128GCM-SHA256,ECDHE-ECDSA-AES256CBC-SHA384,ECDHE-RSA-AES256CBC-SHA384,DHE-RSA-AES256-SHA256,ECDHE-ECDSA-AES256CBC-SHA,ECDHE-RSA-AES256CBC-SHA,DHE-RSA-AES256-SHA1,RSA-AES256GCM-SHA384,RSA-AES256-SHA256,RSA-AES256-SHA1]
     --
     -- Since 1.4.2
   , tlsWantClientCert :: Bool
@@ -129,6 +127,15 @@ data TLSSettings = TLSSettings {
     -- Default: Nothing
     --
     -- Since 3.2.2
+  , tlsSessionManagerConfig :: Maybe SM.Config
+    -- ^ Configuration for in-memory TLS session manager.
+    -- If Nothing, 'TLS.noSessionManager' is used.
+    -- Otherwise, an in-memory TLS session manager is created
+    -- according to 'Config'.
+    --
+    -- Default: Nothing
+    --
+    -- Since 3.2.4
   }
 
 -- | Default 'TLSSettings'. Use this to create 'TLSSettings' with the field record name (aka accessors).
@@ -147,24 +154,12 @@ defaultTlsSettings = TLSSettings {
   , tlsWantClientCert = False
   , tlsServerHooks = def
   , tlsServerDHEParams = Nothing
+  , tlsSessionManagerConfig = Nothing
   }
 
 -- taken from stunnel example in tls-extra
 ciphers :: [TLS.Cipher]
-ciphers =
-    [ TLSExtra.cipher_ECDHE_RSA_AES128GCM_SHA256
-    , TLSExtra.cipher_ECDHE_RSA_AES128CBC_SHA256
-    , TLSExtra.cipher_ECDHE_RSA_AES128CBC_SHA
-    , TLSExtra.cipher_DHE_RSA_AES128GCM_SHA256
-    , TLSExtra.cipher_DHE_RSA_AES256_SHA256
-    , TLSExtra.cipher_DHE_RSA_AES128_SHA256
-    , TLSExtra.cipher_DHE_RSA_AES256_SHA1
-    , TLSExtra.cipher_DHE_RSA_AES128_SHA1
-    , TLSExtra.cipher_DHE_DSS_AES128_SHA1
-    , TLSExtra.cipher_DHE_DSS_AES256_SHA1
-    , TLSExtra.cipher_AES128_SHA1
-    , TLSExtra.cipher_AES256_SHA1
-    ]
+ciphers = TLSExtra.ciphersuite_strong
 
 ----------------------------------------------------------------
 
@@ -252,11 +247,14 @@ runTLSSocket tlsset@TLSSettings{..} set sock app = do
             key <- maybe (S.readFile keyFile) return mkey
             either error return $
               TLS.credentialLoadX509ChainFromMemory cert chainCertsMemory key
-    runTLSSocket' tlsset set credential sock app
+    mgr <- case tlsSessionManagerConfig of
+      Nothing     -> return TLS.noSessionManager
+      Just config -> SM.newSessionManager config
+    runTLSSocket' tlsset set credential mgr sock app
 
-runTLSSocket' :: TLSSettings -> Settings -> TLS.Credential -> NS.Socket -> Application -> IO ()
-runTLSSocket' tlsset@TLSSettings{..} set credential sock =
-    runSettingsConnectionMakerSecure set get
+runTLSSocket' :: TLSSettings -> Settings -> TLS.Credential -> TLS.SessionManager -> Socket -> Application -> IO ()
+runTLSSocket' tlsset@TLSSettings{..} set credential mgr sock app =
+    runSettingsConnectionMakerSecure set get app
   where
     get = getter tlsset sock params
     params = def { -- TLS.ServerParams
@@ -273,20 +271,13 @@ runTLSSocket' tlsset@TLSSettings{..} set credential sock =
           (if settingsHTTP2Enabled set then Just alpn else Nothing)
       }
     shared = def {
-        TLS.sharedCredentials = TLS.Credentials [credential]
+        TLS.sharedCredentials    = TLS.Credentials [credential]
+      , TLS.sharedSessionManager = mgr
       }
     supported = def { -- TLS.Supported
         TLS.supportedVersions       = tlsAllowedVersions
       , TLS.supportedCiphers        = tlsCiphers
       , TLS.supportedCompressions   = [TLS.nullCompression]
-      , TLS.supportedHashSignatures = [
-          -- Safari 8 and go tls have bugs on SHA 512 and SHA 384.
-          -- So, we don't specify them here at this moment.
-          (TLS.HashSHA256, TLS.SignatureRSA)
-        , (TLS.HashSHA224, TLS.SignatureRSA)
-        , (TLS.HashSHA1,   TLS.SignatureRSA)
-        , (TLS.HashSHA1,   TLS.SignatureDSS)
-        ]
       , TLS.supportedSecureRenegotiation = True
       , TLS.supportedClientInitiatedRenegotiation = False
       , TLS.supportedSession             = True
@@ -296,9 +287,6 @@ runTLSSocket' tlsset@TLSSettings{..} set credential sock =
 alpn :: [S.ByteString] -> IO S.ByteString
 alpn xs
   | "h2"    `elem` xs = return "h2"
-  | "h2-16" `elem` xs = return "h2-16"
-  | "h2-15" `elem` xs = return "h2-15"
-  | "h2-14" `elem` xs = return "h2-14"
   | otherwise         = return "http/1.1"
 
 ----------------------------------------------------------------
@@ -356,8 +344,16 @@ httpOverTls TLSSettings{..} s bs0 params = do
         sendfile =
             readSendFile writeBuf bufferSize sendall
 
-        close' = void (tryIO $ TLS.bye ctx) `finally`
+        close' = void (tryIO sendBye) `finally`
                  TLS.contextClose ctx
+
+        sendBye =
+          -- It's fine if the connection was closed by the other side before
+          -- receiving close_notify, see RFC 5246 section 7.2.1.
+          handleJust
+            (\e -> guard (e == ConnectionClosedByPeer) >> return e)
+            (const (return ()))
+            (TLS.bye ctx)
 
         -- TLS version of recv with a cache for leftover input data.
         -- The cache is shared with recvBuf.

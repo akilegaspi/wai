@@ -19,7 +19,7 @@ import qualified Data.IORef as I
 import Data.Streaming.Network (bindPortTCP, getSocketTCP, safeRecv)
 import Network (connectTo, PortID (PortNumber))
 import Network.HTTP.Types
-import Network.Socket (sClose)
+import Network.Socket (close)
 import Network.Socket.ByteString (sendAll)
 import Network.Wai
 import Network.Wai.Handler.Warp
@@ -84,7 +84,7 @@ getPort = do
     case esocket of
         Left (_ :: IOException) -> RunSpec.getPort
         Right socket -> do
-            sClose socket
+            close socket
             return port
 
 withApp :: Settings -> Application -> (Int -> IO a) -> IO a
@@ -376,6 +376,12 @@ spec = do
         withApp defaultSettings app $ \port -> do
             res <- sendGET $ "http://127.0.0.1:" ++ show port
             rspBody res `shouldBe` "HelloHelloHelloHello"
+
+    it "file with non-200 status #644" $ do
+        let app _ f = f $ responseFile status404 [] "attic/test.txt" Nothing
+        withApp defaultSettings app $ \port -> do
+          res <- sendHEAD $ "http://127.0.0.1:" ++ show port
+          rspCode res `shouldBe` (4, 0, 4)
 
     describe "head requests" $ do
         let fp = "test/head-response"

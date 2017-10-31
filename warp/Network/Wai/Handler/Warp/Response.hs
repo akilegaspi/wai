@@ -11,20 +11,10 @@ module Network.Wai.Handler.Warp.Response (
   , warpVersion
   , hasBody
   , replaceHeader
+  , addServer -- testing
   ) where
 
-#ifndef MIN_VERSION_base
-#define MIN_VERSION_base(x,y,z) 1
-#endif
-
-#ifndef MIN_VERSION_http_types
-#define MIN_VERSION_http_types(x,y,z) 1
-#endif
-
 import Blaze.ByteString.Builder.HTTP (chunkedTransferEncoding, chunkedTransferTerminator)
-#if __GLASGOW_HASKELL__ < 709
-import Control.Applicative
-#endif
 import qualified Control.Exception as E
 import Control.Monad (unless, when)
 import Data.Array ((!))
@@ -37,21 +27,12 @@ import qualified Data.CaseInsensitive as CI
 import Data.Function (on)
 import Data.List (deleteBy)
 import Data.Maybe
-#if MIN_VERSION_base(4,5,0)
-# if __GLASGOW_HASKELL__ < 709
-import Data.Monoid (mempty)
-# endif
 import Data.Monoid ((<>))
-#else
-import Data.Monoid (mappend, mempty)
-#endif
 import Data.Streaming.Blaze (newBlazeRecv, reuseBufferStrategy)
 import Data.Version (showVersion)
 import Data.Word8 (_cr, _lf)
 import qualified Network.HTTP.Types as H
-#if MIN_VERSION_http_types(0,9,0)
 import qualified Network.HTTP.Types.Header as H
-#endif
 import Network.Wai
 import Network.Wai.Handler.Warp.Buffer (toBuilderBuffer)
 import qualified Network.Wai.Handler.Warp.Date as D
@@ -64,11 +45,6 @@ import qualified Network.Wai.Handler.Warp.Timeout as T
 import Network.Wai.Handler.Warp.Types
 import Network.Wai.Internal
 import qualified Paths_warp
-
-#if !MIN_VERSION_base(4,5,0)
-(<>) :: Monoid m => m -> m -> m
-(<>) = mappend
-#endif
 
 -- $setup
 -- >>> :set -XOverloadedStrings
@@ -410,11 +386,7 @@ hasBody s = sc /= 204
 ----------------------------------------------------------------
 
 addTransferEncoding :: H.ResponseHeaders -> H.ResponseHeaders
-#if MIN_VERSION_http_types(0,9,0)
 addTransferEncoding hdrs = (H.hTransferEncoding, "chunked") : hdrs
-#else
-addTransferEncoding hdrs = ("transfer-encoding", "chunked") : hdrs
-#endif
 
 addDate :: IO D.GMTDate -> IndexedHeader -> H.ResponseHeaders -> IO H.ResponseHeaders
 addDate getdate rspidxhdr hdrs = case rspidxhdr ! fromEnum ResDate of
@@ -429,7 +401,11 @@ addDate getdate rspidxhdr hdrs = case rspidxhdr ! fromEnum ResDate of
 warpVersion :: String
 warpVersion = showVersion Paths_warp.version
 
+{-# INLINE addServer #-}
 addServer :: HeaderValue -> IndexedHeader -> H.ResponseHeaders -> H.ResponseHeaders
+addServer "" rspidxhdr hdrs = case rspidxhdr ! fromEnum ResServer of
+    Nothing -> hdrs
+    _       -> filter ((/= H.hServer) . fst) hdrs
 addServer serverName rspidxhdr hdrs = case rspidxhdr ! fromEnum ResServer of
     Nothing -> (H.hServer, serverName) : hdrs
     _       -> hdrs

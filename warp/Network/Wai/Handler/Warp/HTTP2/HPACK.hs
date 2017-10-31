@@ -7,6 +7,7 @@ module Network.Wai.Handler.Warp.HTTP2.HPACK (
   , hpackDecodeHeader
   , just
   , addNecessaryHeaders
+  , addHeader -- testing
   ) where
 
 import qualified Control.Exception as E
@@ -27,9 +28,12 @@ import Network.Wai.Handler.Warp.Types
 
 {-# INLINE addHeader #-}
 addHeader :: Token -> ByteString -> ValueTable -> TokenHeaderList -> TokenHeaderList
+addHeader t "" tbl ths = case getHeaderValue t tbl of
+    Nothing -> ths
+    _       -> filter ((/= tokenServer) . fst) ths
 addHeader t v tbl ths = case getHeaderValue t tbl of
     Nothing -> (t,v) : ths
-    Just _  -> ths
+    _       -> ths
 
 addNecessaryHeaders :: Context
                     -> Rspn
@@ -89,7 +93,6 @@ checkRequestHeader reqvt
   | mScheme     == Nothing      = False
   | mPath       == Nothing      = False
   | mPath       == Just ""      = False
-  | mAuthority  == Nothing      = False
   | mConnection /= Nothing      = False
   | just mTE (/= "trailers")    = False
   | otherwise                   = True
@@ -98,7 +101,6 @@ checkRequestHeader reqvt
     mScheme     = getHeaderValue tokenScheme reqvt
     mPath       = getHeaderValue tokenPath reqvt
     mMethod     = getHeaderValue tokenMethod reqvt
-    mAuthority  = getHeaderValue tokenAuthority reqvt
     mConnection = getHeaderValue tokenConnection reqvt
     mTE         = getHeaderValue tokenTE reqvt
 

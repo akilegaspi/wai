@@ -9,9 +9,6 @@
 
 module Network.Wai.Handler.Warp.Run where
 
-#if __GLASGOW_HASKELL__ < 709
-import Control.Applicative ((<$>))
-#endif
 import Control.Arrow (first)
 import qualified Control.Concurrent as Conc (yield)
 import Control.Exception as E
@@ -20,7 +17,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as S
 import Data.Char (chr)
 import "iproute" Data.IP (toHostAddress, toHostAddress6)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
 import Data.Streaming.Network (bindPortTCP)
 import Foreign.C.Error (Errno(..), eCONNABORTED)
 import GHC.IO.Exception (IOException(..))
@@ -35,7 +32,6 @@ import qualified Network.Wai.Handler.Warp.FdCache as F
 import qualified Network.Wai.Handler.Warp.FileInfoCache as I
 import Network.Wai.Handler.Warp.HTTP2 (http2, isHTTP2)
 import Network.Wai.Handler.Warp.Header
-import Network.Wai.Handler.Warp.IORef
 import Network.Wai.Handler.Warp.ReadInt
 import Network.Wai.Handler.Warp.Recv
 import Network.Wai.Handler.Warp.Request
@@ -71,11 +67,6 @@ socketConnection s = do
       , connWriteBuffer = writeBuf
       , connBufferSize = bufferSize
       }
-
-#if __GLASGOW_HASKELL__ < 702
-allowInterrupt :: IO ()
-allowInterrupt = unblock $ return ()
-#endif
 
 -- | Run an 'Application' on the given port.
 -- This calls 'runSettings' with 'defaultSettings'.
@@ -331,17 +322,18 @@ serveConnection conn ii1 origAddr transport settings app = do
                        return (True, bs0)
                      else
                        return (False, bs0)
+    istatus <- newIORef False
     if settingsHTTP2Enabled settings && h2 then do
-        recvN <- makeReceiveN bs (connRecv conn) (connRecvBuf conn)
+        rawRecvN <- makeReceiveN bs (connRecv conn) (connRecvBuf conn)
+        let recvN = wrappedRecvN th istatus (settingsSlowlorisSize settings) rawRecvN
         -- fixme: origAddr
         http2 conn ii1 origAddr transport settings recvN app
       else do
-        istatus <- newIORef False
         src <- mkSource (wrappedRecv conn th istatus (settingsSlowlorisSize settings))
         writeIORef istatus True
         leftoverSource src bs
         addr <- getProxyProtocolAddr src
-        http1 addr istatus src `E.catch` \e -> do
+        http1 True addr istatus src `E.catch` \e -> do
             sendErrorResponse addr istatus e
             throwIO (e :: SomeException)
   where
@@ -402,8 +394,8 @@ serveConnection conn ii1 origAddr transport settings app = do
 
     errorResponse e = settingsOnExceptionResponse settings e
 
-    http1 addr istatus src = do
-        (req', mremainingRef, idxhdr, nextBodyFlush, ii) <- recvRequest settings conn ii1 addr src
+    http1 firstRequest addr istatus src = do
+        (req', mremainingRef, idxhdr, nextBodyFlush, ii) <- recvRequest firstRequest settings conn ii1 addr src
         let req = req' { isSecure = isTransportSecure transport }
         keepAlive <- processRequest istatus src req mremainingRef idxhdr nextBodyFlush ii
             `E.catch` \e -> do
@@ -412,7 +404,16 @@ serveConnection conn ii1 origAddr transport settings app = do
                 settingsOnException settings (Just req) e
                 -- Don't throw the error again to prevent calling settingsOnException twice.
                 return False
-        when keepAlive $ http1 addr istatus src
+
+        -- When doing a keep-alive connection, the other side may just
+        -- close the connection. We don't want to treat that as an
+        -- exceptional situation, so we pass in False to http1 (which
+        -- in turn passes in False to recvRequest), indicating that
+        -- this is not the first request. If, when trying to read the
+        -- request headers, no data is available, recvRequest will
+        -- throw a NoKeepAliveRequest exception, which we catch here
+        -- and ignore. See: https://github.com/yesodweb/wai/issues/618
+        when keepAlive $ http1 False addr istatus src `E.catch` \NoKeepAliveRequest -> return ()
 
     processRequest istatus src req mremainingRef idxhdr nextBodyFlush ii = do
         -- Let the application run for as long as it wants
@@ -501,6 +502,19 @@ wrappedRecv Connection { connRecv = recv } th istatus slowlorisSize = do
     unless (S.null bs) $ do
         writeIORef istatus True
         when (S.length bs >= slowlorisSize) $ T.tickle th
+    return bs
+
+wrappedRecvN :: T.Handle -> IORef Bool -> Int -> (BufSize -> IO ByteString) -> (BufSize -> IO ByteString)
+wrappedRecvN th istatus slowlorisSize readN bufsize = do
+    bs <- readN bufsize
+    unless (S.null bs) $ do
+        writeIORef istatus True
+    -- TODO: think about the slowloris protection in HTTP2: current code
+    -- might open a slow-loris attack vector. Rather than timing we should
+    -- consider limiting the per-client connections assuming that in HTTP2
+    -- we should allow only few connections per host (real-world
+    -- deployments with large NATs may be trickier).
+        when (S.length bs >= slowlorisSize || bufsize <= slowlorisSize) $ T.tickle th
     return bs
 
 -- Copied from: https://github.com/mzero/plush/blob/master/src/Plush/Server/Warp.hs
